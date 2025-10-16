@@ -1,4 +1,3 @@
 Flask
 gunicorn
-psycopg2-binary
-PyNaCl
+psycopg[binary]
