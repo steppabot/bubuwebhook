@@ -117,15 +117,28 @@ def handle_event(cur, evt: Dict[str, Any]):
 # --- Webhook route ---
 @app.route("/discord/monetization", methods=["GET", "HEAD", "POST"])
 def monetization():
-    # Discord's dashboard verification uses GET/HEAD — just return 200 fast
+    # Discord dashboard "Test Delivery" uses GET/HEAD
     if request.method in ("GET", "HEAD"):
         return "ok", 200
 
-    # real events come as POST JSON
+    # Real events (can be a single object or a list)
     payload = request.get_json(force=True, silent=False)
-    if isinstance(payload, list):
-        for evt in payload:
-            handle_event(evt)
-    else:
-        handle_event(payload)
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if isinstance(payload, list):
+                    for evt in payload:
+                        handle_event(cur, evt)          # <-- pass cursor
+                else:
+                    handle_event(cur, payload)          # <-- pass cursor
+            conn.commit()
+    except Exception as e:
+        # Optional: log e
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        abort(400, description="failed to process webhook")
+
     return jsonify({"ok": True})
