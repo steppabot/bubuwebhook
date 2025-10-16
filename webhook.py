@@ -115,20 +115,17 @@ def handle_event(cur, evt: Dict[str, Any]):
             pass
 
 # --- Webhook route ---
-@app.post("/discord/monetization")
+@app.route("/discord/monetization", methods=["GET", "HEAD", "POST"])
 def monetization():
-    # (Optional signature verify block goes here; you said you’re skipping it.)
+    # Discord's dashboard verification uses GET/HEAD — just return 200 fast
+    if request.method in ("GET", "HEAD"):
+        return "ok", 200
 
+    # real events come as POST JSON
     payload = request.get_json(force=True, silent=False)
-
-    # One connection/tx for the whole batch
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if isinstance(payload, list):
-                for evt in payload:
-                    handle_event(cur, evt)
-            else:
-                handle_event(cur, payload)
-        conn.commit()  # single commit
-
+    if isinstance(payload, list):
+        for evt in payload:
+            handle_event(evt)
+    else:
+        handle_event(payload)
     return jsonify({"ok": True})
