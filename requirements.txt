@@ -1,3 +1,4 @@
-Flask==3.0.0
-gunicorn==21.2.0
-psycopg[binary]==3.1.19
+Flask
+gunicorn
+psycopg2-binary
+PyNaCl
