@@ -1,0 +1,44 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.cache/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+.dmypy.json
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+
+# Environment / secrets (keep in Heroku config vars)
+.env
+.env.*
+*.env
+
+# Coverage / test output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
