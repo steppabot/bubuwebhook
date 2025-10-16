@@ -1,26 +1,30 @@
 import os
+import time
 import logging
+import binascii
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, request, jsonify, abort
 import psycopg
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# --- DB helpers (single conn per request) ---
+DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "").strip()
+
+# ======================================================
+#                     DB HELPERS
+# ======================================================
 def get_conn():
     dsn = os.environ["DATABASE_URL"]
     if "sslmode=" not in dsn:
         dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
-    # psycopg v3 connection; context manager will commit/rollback on exit if autocommit=False
     return psycopg.connect(dsn)
 
 def _parse_iso(s: Optional[str]):
-    """
-    Discord timestamps come like '2025-01-02T03:04:05.678Z' — convert to aware UTC datetimes.
-    """
     if not s:
         return None
     try:
@@ -28,12 +32,11 @@ def _parse_iso(s: Optional[str]):
     except Exception:
         return None
 
-# --- Core persistence (use an existing cursor) ---
+# ======================================================
+#                 DB CORE OPERATIONS
+# ======================================================
 def ensure_user(cur, user_id: int):
-    cur.execute(
-        "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;",
-        (user_id,)
-    )
+    cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
 
 def _normalize_status(raw: Optional[str]) -> str:
     s = (raw or "").strip().lower()
@@ -41,13 +44,9 @@ def _normalize_status(raw: Optional[str]) -> str:
         return "active"
     if s in ("revoked", "expired", "canceled", "cancelled"):
         return "revoked"
-    # treat unknown/empty as active to avoid accidental downgrades on weird payloads
     return "active" if not s else s
 
 def upsert_entitlement(cur, ent: Dict[str, Any]):
-    """
-    Upsert the entitlement row. 'status' is normalized to 'active' or 'revoked' for gating.
-    """
     status = _normalize_status(ent.get("status"))
     cur.execute(
         """
@@ -87,10 +86,6 @@ def mark_premium(cur, user_id: int, ends_at):
     )
 
 def remove_premium_if_no_active(cur, user_id: int):
-    """
-    Only downgrade if there are no still-active entitlements.
-    We consider an entitlement 'active' if status='active' AND ends_at is null or in the future.
-    """
     cur.execute(
         """
         SELECT 1
@@ -114,37 +109,22 @@ def remove_premium_if_no_active(cur, user_id: int):
         )
 
 def delete_entitlement(cur, entitlement_id: str) -> Optional[int]:
-    """
-    Delete entitlement; return user_id if we could resolve it (for subsequent downgrade check).
-    """
     user_id: Optional[int] = None
     try:
-        cur.execute(
-            "SELECT user_id FROM entitlements WHERE entitlement_id=%s;",
-            (entitlement_id,),
-        )
+        cur.execute("SELECT user_id FROM entitlements WHERE entitlement_id=%s;", (entitlement_id,))
         row = cur.fetchone()
         if row:
             user_id = int(row[0])
     except Exception:
         pass
 
-    cur.execute(
-        "DELETE FROM entitlements WHERE entitlement_id=%s;",
-        (entitlement_id,),
-    )
+    cur.execute("DELETE FROM entitlements WHERE entitlement_id=%s;", (entitlement_id,))
     return user_id
 
-# --- Event handling (uses one cursor) ---
+# ======================================================
+#                    EVENT HANDLER
+# ======================================================
 def handle_event(cur, evt: Dict[str, Any]):
-    """
-    Discord monetization schema (summary):
-      {
-        "type": "ENTITLEMENT_CREATE" | "ENTITLEMENT_UPDATE" | "ENTITLEMENT_DELETE",
-        "data": { ... } | [ { ... }, ... ]
-      }
-    Each data item includes at least: id, user_id, sku_id, starts_at, ends_at, status, is_gift
-    """
     etype = (evt.get("type") or "").upper()
     data = evt.get("data", {})
     items: List[Dict[str, Any]] = data if isinstance(data, list) else [data]
@@ -153,7 +133,6 @@ def handle_event(cur, evt: Dict[str, Any]):
         if not item:
             continue
 
-        # Some DELETE payloads may not include user_id; we handle that below.
         uid = int(item.get("user_id") or 0)
 
         if etype == "ENTITLEMENT_CREATE":
@@ -171,10 +150,8 @@ def handle_event(cur, evt: Dict[str, Any]):
                 remove_premium_if_no_active(cur, uid)
 
         elif etype == "ENTITLEMENT_DELETE":
-            # Resolve user_id if missing, then delete, then conditional downgrade
             ent_id = item.get("id")
             if not ent_id:
-                # nothing we can do safely
                 logging.warning("DELETE without entitlement id: %r", item)
                 continue
             resolved_uid = delete_entitlement(cur, ent_id)
@@ -183,17 +160,49 @@ def handle_event(cur, evt: Dict[str, Any]):
                 remove_premium_if_no_active(cur, final_uid)
 
         else:
-            # ignore unrelated events
             logging.info("Ignoring event type: %s", etype)
 
-# --- Webhook route ---
+# ======================================================
+#              DISCORD SIGNATURE VERIFICATION
+# ======================================================
+def _verify_discord_request(req):
+    if not DISCORD_PUBLIC_KEY:
+        app.logger.error("DISCORD_PUBLIC_KEY is not set")
+        abort(500, description="server not configured")
+
+    sig = req.headers.get("X-Signature-Ed25519")
+    ts = req.headers.get("X-Signature-Timestamp")
+
+    if not sig or not ts:
+        abort(401, description="missing signature headers")
+
+    # Optional: reject stale requests (>5min old)
+    try:
+        now = int(time.time())
+        ts_i = int(ts)
+        if abs(now - ts_i) > 300:
+            abort(401, description="stale request")
+    except Exception:
+        abort(401, description="bad timestamp")
+
+    body = req.get_data(cache=True, as_text=False)
+    try:
+        verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+        verify_key.verify(ts.encode() + body, bytes.fromhex(sig))
+    except (BadSignatureError, binascii.Error, ValueError):
+        abort(401, description="invalid signature")
+
+# ======================================================
+#                     FLASK ROUTE
+# ======================================================
 @app.route("/discord/monetization", methods=["GET", "HEAD", "POST"])
 def monetization():
-    # Discord dashboard verification / test
     if request.method in ("GET", "HEAD"):
         return "ok", 200
 
-    # Real events (can be a single object or a list)
+    # verify Discord signature before parsing JSON
+    _verify_discord_request(request)
+
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         abort(400, description="invalid json")
@@ -209,7 +218,6 @@ def monetization():
                     handle_event(cur, payload)
                 else:
                     abort(400, description="unexpected payload")
-            # context manager will commit; explicit commit is fine too:
             conn.commit()
     except Exception as e:
         logging.exception("Webhook error: %s", e)
