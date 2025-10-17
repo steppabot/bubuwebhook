@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import logging
 import binascii
@@ -11,6 +12,7 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 app = Flask(__name__)
+# INFO is good for prod; switch to DEBUG if you want more noise
 logging.basicConfig(level=logging.INFO)
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "").strip()
@@ -36,7 +38,10 @@ def _parse_iso(s: Optional[str]):
 #                 DB CORE OPERATIONS
 # ======================================================
 def ensure_user(cur, user_id: int):
-    cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
+    cur.execute(
+        "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;",
+        (user_id,),
+    )
 
 def _normalize_status(raw: Optional[str]) -> str:
     s = (raw or "").strip().lower()
@@ -111,14 +116,20 @@ def remove_premium_if_no_active(cur, user_id: int):
 def delete_entitlement(cur, entitlement_id: str) -> Optional[int]:
     user_id: Optional[int] = None
     try:
-        cur.execute("SELECT user_id FROM entitlements WHERE entitlement_id=%s;", (entitlement_id,))
+        cur.execute(
+            "SELECT user_id FROM entitlements WHERE entitlement_id=%s;",
+            (entitlement_id,),
+        )
         row = cur.fetchone()
         if row:
             user_id = int(row[0])
     except Exception:
         pass
 
-    cur.execute("DELETE FROM entitlements WHERE entitlement_id=%s;", (entitlement_id,))
+    cur.execute(
+        "DELETE FROM entitlements WHERE entitlement_id=%s;",
+        (entitlement_id,),
+    )
     return user_id
 
 # ======================================================
@@ -166,21 +177,27 @@ def handle_event(cur, evt: Dict[str, Any]):
 #              DISCORD SIGNATURE VERIFICATION
 # ======================================================
 def _verify_discord_request(req):
+    """
+    Monetization Webhook Events are signed using the same Ed25519 scheme as Interactions.
+    Headers:
+      - X-Signature-Ed25519
+      - X-Signature-Timestamp
+    Verify with your app's PUBLIC KEY.
+    """
     if not DISCORD_PUBLIC_KEY:
         app.logger.error("DISCORD_PUBLIC_KEY is not set")
         abort(500, description="server not configured")
 
     sig = req.headers.get("X-Signature-Ed25519")
     ts = req.headers.get("X-Signature-Timestamp")
-
     if not sig or not ts:
         abort(401, description="missing signature headers")
 
-    # Optional: reject stale requests (>5min old)
+    # Optional: reject stale requests (>10min old)
     try:
         now = int(time.time())
         ts_i = int(ts)
-        if abs(now - ts_i) > 300:
+        if abs(now - ts_i) > 600:
             abort(401, description="stale request")
     except Exception:
         abort(401, description="bad timestamp")
@@ -193,20 +210,39 @@ def _verify_discord_request(req):
         abort(401, description="invalid signature")
 
 # ======================================================
-#                     FLASK ROUTE
+#                     FLASK ROUTES
 # ======================================================
 @app.route("/discord/monetization", methods=["GET", "HEAD", "POST"])
 def monetization():
+    # Health check
     if request.method in ("GET", "HEAD"):
         return "ok", 200
 
-    # verify Discord signature before parsing JSON
+    # ===== Debug logs to prove delivery =====
+    try:
+        app.logger.info("Webhook -> Method: %s", request.method)
+        # Show only security-related headers & UA to avoid leaking anything sensitive
+        masked_headers = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower().startswith("x-signature") or k.lower() in ("user-agent", "content-type")
+        }
+        app.logger.info("Webhook -> Headers: %s", masked_headers)
+        app.logger.info("Webhook -> Raw body: %s", request.get_data(as_text=True))
+    except Exception as e:
+        app.logger.warning("Failed to log incoming request: %s", e)
+
+    # Verify Discord signature before parsing JSON
     _verify_discord_request(request)
 
+    # Parse JSON payload
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         abort(400, description="invalid json")
 
+    app.logger.info("Webhook -> Parsed payload: %s", payload)
+
+    # Process & persist
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -228,3 +264,8 @@ def monetization():
         abort(400, description="failed to process webhook")
 
     return jsonify({"ok": True})
+
+# Optional: a quick root health check
+@app.route("/", methods=["GET"])
+def root():
+    return "alive", 200
