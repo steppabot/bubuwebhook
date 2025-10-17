@@ -12,7 +12,6 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 app = Flask(__name__)
-# INFO is good for prod; switch to DEBUG if you want more noise
 logging.basicConfig(level=logging.INFO)
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "").strip()
@@ -133,10 +132,42 @@ def delete_entitlement(cur, entitlement_id: str) -> Optional[int]:
     return user_id
 
 # ======================================================
+#                  EVENT NORMALIZATION
+# ======================================================
+def _event_name(evt: Dict[str, Any]) -> str:
+    """
+    Normalizes Discord webhook event name.
+    Handles both string and int 'type' values.
+    """
+    t = evt.get("type")
+
+    # String case
+    if isinstance(t, str):
+        return t.upper().strip()
+
+    # Int case (e.g., ping)
+    if isinstance(t, int):
+        if t == 1:
+            return "PING"
+        alt = (evt.get("event") or evt.get("event_type") or "").strip()
+        if alt:
+            return alt.upper()
+        return ""
+
+    # Fallback
+    alt = (evt.get("event") or evt.get("event_type") or "").strip()
+    return alt.upper()
+
+# ======================================================
 #                    EVENT HANDLER
 # ======================================================
 def handle_event(cur, evt: Dict[str, Any]):
-    etype = (evt.get("type") or "").upper()
+    etype = _event_name(evt)
+
+    if etype in ("PING", "", None):
+        logging.info("Ignoring webhook event type=%r (ping or unknown)", etype)
+        return
+
     data = evt.get("data", {})
     items: List[Dict[str, Any]] = data if isinstance(data, list) else [data]
 
@@ -144,7 +175,15 @@ def handle_event(cur, evt: Dict[str, Any]):
         if not item:
             continue
 
-        uid = int(item.get("user_id") or 0)
+        # Flatten if entitlement is nested
+        if "entitlement" in item and isinstance(item["entitlement"], dict):
+            item = item["entitlement"]
+
+        uid_raw = item.get("user_id") or item.get("user", {}).get("id")
+        if not uid_raw:
+            logging.warning("No user_id in entitlement payload: %r", item)
+            continue
+        uid = int(uid_raw)
 
         if etype == "ENTITLEMENT_CREATE":
             ensure_user(cur, uid)
@@ -161,7 +200,7 @@ def handle_event(cur, evt: Dict[str, Any]):
                 remove_premium_if_no_active(cur, uid)
 
         elif etype == "ENTITLEMENT_DELETE":
-            ent_id = item.get("id")
+            ent_id = item.get("id") or item.get("entitlement_id")
             if not ent_id:
                 logging.warning("DELETE without entitlement id: %r", item)
                 continue
@@ -171,18 +210,17 @@ def handle_event(cur, evt: Dict[str, Any]):
                 remove_premium_if_no_active(cur, final_uid)
 
         else:
-            logging.info("Ignoring event type: %s", etype)
+            logging.info("Unhandled event type: %s", etype)
 
 # ======================================================
 #              DISCORD SIGNATURE VERIFICATION
 # ======================================================
 def _verify_discord_request(req):
     """
-    Monetization Webhook Events are signed using the same Ed25519 scheme as Interactions.
+    Monetization Webhook Events are signed using Ed25519 (same as Interactions).
     Headers:
       - X-Signature-Ed25519
       - X-Signature-Timestamp
-    Verify with your app's PUBLIC KEY.
     """
     if not DISCORD_PUBLIC_KEY:
         app.logger.error("DISCORD_PUBLIC_KEY is not set")
@@ -193,7 +231,7 @@ def _verify_discord_request(req):
     if not sig or not ts:
         abort(401, description="missing signature headers")
 
-    # Optional: reject stale requests (>10min old)
+    # Optional: reject stale requests (>10min)
     try:
         now = int(time.time())
         ts_i = int(ts)
@@ -218,10 +256,9 @@ def monetization():
     if request.method in ("GET", "HEAD"):
         return "ok", 200
 
-    # ===== Debug logs to prove delivery =====
+    # Log everything for visibility
     try:
         app.logger.info("Webhook -> Method: %s", request.method)
-        # Show only security-related headers & UA to avoid leaking anything sensitive
         masked_headers = {
             k: v
             for k, v in request.headers.items()
@@ -232,17 +269,22 @@ def monetization():
     except Exception as e:
         app.logger.warning("Failed to log incoming request: %s", e)
 
-    # Verify Discord signature before parsing JSON
+    # Verify Discord signature
     _verify_discord_request(request)
 
-    # Parse JSON payload
+    # Parse payload
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         abort(400, description="invalid json")
 
     app.logger.info("Webhook -> Parsed payload: %s", payload)
 
-    # Process & persist
+    # Quick ping ACK
+    if isinstance(payload, dict) and payload.get("type") == 1:
+        app.logger.info("Webhook PING received; returning 200")
+        return jsonify({"ok": True, "pong": True})
+
+    # Process event(s)
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -265,7 +307,6 @@ def monetization():
 
     return jsonify({"ok": True})
 
-# Optional: a quick root health check
 @app.route("/", methods=["GET"])
 def root():
     return "alive", 200
