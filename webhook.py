@@ -162,6 +162,10 @@ def _event_name(evt: Dict[str, Any]) -> str:
 #                    EVENT HANDLER
 # ======================================================
 def handle_event(cur, evt: Dict[str, Any]):
+    """
+    Expects an event dict shaped like:
+      { "type": "ENTITLEMENT_CREATE", "data": {...} }
+    """
     etype = _event_name(evt)
 
     if etype in ("PING", "", None):
@@ -279,12 +283,31 @@ def monetization():
 
     app.logger.info("Webhook -> Parsed payload: %s", payload)
 
-    # Quick ping ACK
+    # Envelope handling:
+    # If Discord wraps the real event inside an "event" object,
+    # process that. Only treat as ping if no event is present.
+    if isinstance(payload, dict) and "event" in payload and isinstance(payload["event"], dict):
+        evt = payload["event"]
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    handle_event(cur, evt)
+                conn.commit()
+        except Exception as e:
+            logging.exception("Webhook error (enveloped): %s", e)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            abort(400, description="failed to process webhook")
+        return jsonify({"ok": True})
+
+    # Legacy/simple case: payload itself is the event or a batch of events
+    # Quick ping ACK only when there's no embedded event
     if isinstance(payload, dict) and payload.get("type") == 1:
-        app.logger.info("Webhook PING received; returning 200")
+        app.logger.info("Webhook PING (no embedded event); returning 200")
         return jsonify({"ok": True, "pong": True})
 
-    # Process event(s)
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
