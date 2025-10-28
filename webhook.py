@@ -9,7 +9,7 @@ import requests
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-BUBU_DATABASE_URL   = os.getenv("BUBU_DATABASE_URL") or os.getenv("DATABASE_URL")
+BUBU_DATABASE_URL   = os.getenv("DATABASE_URL")
 STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY")
 WEBHOOK_SECRET      = os.getenv("STRIPE_WEBHOOK_SECRET")
 PREMIUM_PRICE_ID    = os.getenv("PREMIUM_PRICE_ID")              # e.g. price_123
