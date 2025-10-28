@@ -269,9 +269,9 @@ def stripe_webhook():
 
                     payload = {
                         "embeds": [{
-                            "title": "✅ Bubu Bot Premium Activated",
+                            "title": "☑️ Bubu Bot Premium Activated",
                             "description": "Thanks for your support! You now have access to all premium features.",
-                            "color": 0x50BF84
+                            "color": 0xBCE5FF
                         }],
                         "components": []
                     }
